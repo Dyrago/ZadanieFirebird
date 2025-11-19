@@ -1,7 +1,8 @@
+using FirebirdSql.Data.FirebirdClient;
+using FirebirdSql.Data.Isql;
 using System;
 using System.IO;
 using System.Text;
-using FirebirdSql.Data.FirebirdClient;
 
 namespace DbMetaTool
 {
@@ -96,11 +97,20 @@ namespace DbMetaTool
             }
 
             string dbPath = Path.Combine(databaseDirectory, "database.fdb");
+
+            if (File.Exists(dbPath))
+            {
+                Logger.Warning($"W podanej lojakizacji {databaseDirectory} baza już istnieje!");
+                Logger.Warning("Wybierz inną lokalizację lub usuń istniejącą bazę.");
+                return;
+            }
+
             string connStr = new FbConnectionStringBuilder
             {
                 Database = dbPath,
                 ServerType = FbServerType.Default,
-                UserID = "sysdba",
+                DataSource = "localhost",
+                UserID = "SYSDBA",
                 Password = "masterkey",
                 ClientLibrary = "fbclient.dll"
             }.ToString();
@@ -139,10 +149,9 @@ namespace DbMetaTool
                     {
                         Logger.Info($"Wykonywanie: {Path.GetFileName(file)}");
 
-                        string sql = File.ReadAllText(file);
-                        ExecuteSqlBatch(conn, sql);
+                        ExecuteSqlFile(conn, file);
 
-                        Logger.Success($"✔ Zakończono: {Path.GetFileName(file)}");
+                        Logger.Success($"Zakończono: {Path.GetFileName(file)}");
                     }
                     catch (Exception exFile)
                     {
@@ -176,16 +185,38 @@ namespace DbMetaTool
             conn.Open();
             Logger.Info("Nawiązano połączenie z bazą danych");
 
-            Logger.Info(" Nawiązano połączenie z bazą danych.");
+            try
+            {
+                ExportDomains(conn, outputDirectory);
+                Logger.Success("Pomyślnie eksportowano domeny.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Bład podczas eksportowania domen.");
+                return ;
+            }
 
-            ExportDomains(conn, outputDirectory);
-            Logger.Success("Pomyślnie eksportowano domeny.");
+            try
+            {
+                ExportTables(conn, outputDirectory);
+                Logger.Success("Pomyślnie eksportowano tabele.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Bład podczas eksportowania tabel.");
+                return;
+            }
 
-            ExportTables(conn, outputDirectory);
-            Logger.Success("Pomyślnie eksportowano tabele.");
-
-            ExportProcedures(conn, outputDirectory);
-            Logger.Success("Pomyślnie eksportowano procedury.");
+            try
+            {
+                ExportProcedures(conn, outputDirectory);
+                Logger.Success("Pomyślnie eksportowano procedury.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Bład podczas eksportowania procedur.");
+                return;
+            }
 
             Logger.Success("Pomyślnie eksportowano skrypty.");
         }
@@ -209,31 +240,82 @@ namespace DbMetaTool
 
             foreach (var file in sqlFiles)
             {
-                string sql = File.ReadAllText(file);
-                ExecuteSqlBatch(conn, sql);
+                try
+                {
+                    Logger.Info($"Wykonywanie: {Path.GetFileName(file)}");
+
+                    ExecuteSqlFile(conn, file);
+
+                    Logger.Success($"Zakończono: {Path.GetFileName(file)}");
+                }
+                catch (Exception exFile)
+                {
+                    Logger.Error($"Błąd podczas wykonywania pliku {Path.GetFileName(file)}: {exFile.Message}");
+                    return;
+                }
             }
 
             Logger.Success("Aktualizacja zakończona sukcesem.");
         }
 
-        private static void ExecuteSqlBatch(FbConnection conn, string sql)
+        private static void ExecuteSqlFile(FbConnection conn, string file)
         {
-            var batches = sql.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+            ExecuteFirebirdScript(conn, file);
+        }
 
-            foreach (var batch in batches)
+        private static void ExecuteFirebirdScript(FbConnection conn, string sqlFile)
+        {
+            string text = File.ReadAllText(sqlFile);
+
+            string currentTerm = ";";
+            var sb = new StringBuilder();
+
+            foreach (var line in File.ReadLines(sqlFile))
             {
-                string trimmed = batch.Trim();
-                if (string.IsNullOrWhiteSpace(trimmed))
-                    continue;
+                string trimmed = line.Trim();
 
-                using var cmd = new FbCommand(trimmed, conn);
-                cmd.ExecuteNonQuery();
+                // Obsługa SET TERM
+                if (trimmed.StartsWith("SET TERM", StringComparison.OrdinalIgnoreCase))
+                {
+                    // przykład: SET TERM ^ ;
+                    var parts = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+                    if (parts.Length >= 3)
+                    {
+                        string newTerm = parts[2]; // np ^
+
+                        currentTerm = newTerm;
+                    }
+
+                    sb.Clear();
+                    continue;
+                }
+
+                sb.AppendLine(line);
+
+                // Czy kończy się terminatorem?
+                if (trimmed.EndsWith(currentTerm))
+                {
+                    // usuń terminator
+                    string command = sb.ToString()
+                        .TrimEnd()
+                        .Replace(currentTerm, string.Empty)
+                        .TrimEnd();
+
+                    sb.Clear();
+
+                    if (string.IsNullOrWhiteSpace(command))
+                        continue;
+
+                    using var cmd = new FbCommand(command, conn);
+                    cmd.ExecuteNonQuery();
+                }
             }
         }
 
         private static void ExportDomains(FbConnection conn, string outputDir)
         {
-            string file = Path.Combine(outputDir, "domains.sql");
+            string file = Path.Combine(outputDir, "001_domains.sql");
             using var sw = new StreamWriter(file, false, Encoding.UTF8);
 
             string sql =
@@ -255,7 +337,7 @@ namespace DbMetaTool
 
         private static void ExportTables(FbConnection conn, string outputDir)
         {
-            string file = Path.Combine(outputDir, "tables.sql");
+            string file = Path.Combine(outputDir, "002_tables.sql");
             using var sw = new StreamWriter(file, false, Encoding.UTF8);
 
             // All user tables (exclude system + views)
@@ -316,13 +398,13 @@ namespace DbMetaTool
 
         private static void ExportProcedures(FbConnection conn, string outputDir)
         {
-            string file = Path.Combine(outputDir, "procedures.sql");
+            string file = Path.Combine(outputDir, "003_procedures.sql");
             using var sw = new StreamWriter(file, false, Encoding.UTF8);
 
             string sql =
                 @"SELECT RDB$PROCEDURE_NAME, RDB$PROCEDURE_SOURCE
-                  FROM RDB$PROCEDURES
-                  WHERE RDB$SYSTEM_FLAG = 0";
+          FROM RDB$PROCEDURES
+          WHERE RDB$SYSTEM_FLAG = 0";
 
             using var cmd = new FbCommand(sql, conn);
             using var r = cmd.ExecuteReader();
@@ -332,11 +414,54 @@ namespace DbMetaTool
                 string name = r.GetString(0).Trim();
                 string source = r.IsDBNull(1) ? "" : r.GetString(1);
 
-                if (!string.IsNullOrWhiteSpace(source))
+                // Pobranie parametrów procedury
+                string paramSql = @"SELECT 
+                                    RDB$PARAMETER_NAME, 
+                                    RDB$PARAMETER_TYPE, -- 0 = input, 1 = output
+                                    F.RDB$FIELD_TYPE,
+                                    F.RDB$FIELD_SUB_TYPE,
+                                    F.RDB$FIELD_LENGTH,
+                                    F.RDB$FIELD_SCALE,
+                                    F.RDB$CHARACTER_LENGTH,
+                                    F.RDB$CHARACTER_SET_ID
+                                FROM RDB$PROCEDURE_PARAMETERS P
+                                JOIN RDB$FIELDS F ON F.RDB$FIELD_NAME = P.RDB$FIELD_SOURCE
+                                WHERE P.RDB$PROCEDURE_NAME = @procName
+                                ORDER BY P.RDB$PARAMETER_NUMBER";
+
+                using var paramCmd = new FbCommand(paramSql, conn);
+                paramCmd.Parameters.AddWithValue("@procName", name);
+                using var paramR = paramCmd.ExecuteReader();
+
+                var inputParams = new List<string>();
+                var outputParams = new List<string>();
+
+                while (paramR.Read())
                 {
-                    sw.WriteLine(source.Trim() + ";");
-                    sw.WriteLine();
+                    string paramName = paramR.GetString(0).Trim();
+                    short paramType = paramR.GetInt16(1); // 0 = input, 1 = output
+                    short fieldType = paramR.GetInt16(2); // typ Firebirda, trzeba zamienić na SQL
+
+                    string sqlType = MapFbType(fieldType);
+
+                    if (paramType == 0)
+                        inputParams.Add($"{paramName} {sqlType}");
+                    else
+                        outputParams.Add($"{paramName} {sqlType}");
                 }
+
+                // Tworzenie nagłówka procedury
+                sw.WriteLine($"CREATE PROCEDURE {name}");
+
+                if (inputParams.Count > 0)
+                    sw.WriteLine("  (" + string.Join(", ", inputParams) + ")");
+
+                if (outputParams.Count > 0)
+                    sw.WriteLine("RETURNS (" + string.Join(", ", outputParams) + ")");
+
+                sw.WriteLine("SET TERM ^ ;");
+                sw.WriteLine(source.Trim() + "^");
+                sw.WriteLine("SET TERM ; ^");
             }
         }
 
@@ -384,7 +509,7 @@ namespace DbMetaTool
                     var messageFormat = $"{dateFormat} {logLevel}: {message}";
 
                     Console.ForegroundColor = consoleColor;
-                    Console.WriteLine(message);
+                    Console.WriteLine(messageFormat);
                 }
                 finally
                 {
