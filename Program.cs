@@ -99,7 +99,7 @@ namespace DbMetaTool
             string connStr = new FbConnectionStringBuilder
             {
                 Database = dbPath,
-                ServerType = FbServerType.Embedded,
+                ServerType = FbServerType.Default,
                 UserID = "sysdba",
                 Password = "masterkey",
                 ClientLibrary = "fbclient.dll"
@@ -381,7 +381,7 @@ namespace DbMetaTool
                     };
 
                     var dateFormat = DateTime.Now.ToString("[HH:mm:ss]");
-                    var messageFormat = $"{dateFormat} {logLevel: message}";
+                    var messageFormat = $"{dateFormat} {logLevel}: {message}";
 
                     Console.ForegroundColor = consoleColor;
                     Console.WriteLine(message);
