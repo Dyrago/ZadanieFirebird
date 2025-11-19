@@ -267,48 +267,31 @@ namespace DbMetaTool
         {
             string text = File.ReadAllText(sqlFile);
 
-            string currentTerm = ";";
-            var sb = new StringBuilder();
+            // Parse the script
+            var script = new FbScript(text);
+            script.Parse();
 
-            foreach (var line in File.ReadLines(sqlFile))
+            using var cmd = new FbCommand("", conn);
+
+            // Iterate over each parsed statement
+            foreach (var result in script.Results)
             {
-                string trimmed = line.Trim();
+                string statement = result.Text.Trim();
 
-                // Obsługa SET TERM
-                if (trimmed.StartsWith("SET TERM", StringComparison.OrdinalIgnoreCase))
-                {
-                    // przykład: SET TERM ^ ;
-                    var parts = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-
-                    if (parts.Length >= 3)
-                    {
-                        string newTerm = parts[2]; // np ^
-
-                        currentTerm = newTerm;
-                    }
-
-                    sb.Clear();
+                if (string.IsNullOrWhiteSpace(statement))
                     continue;
-                }
 
-                sb.AppendLine(line);
-
-                // Czy kończy się terminatorem?
-                if (trimmed.EndsWith(currentTerm))
+                try
                 {
-                    // usuń terminator
-                    string command = sb.ToString()
-                        .TrimEnd()
-                        .Replace(currentTerm, string.Empty)
-                        .TrimEnd();
-
-                    sb.Clear();
-
-                    if (string.IsNullOrWhiteSpace(command))
-                        continue;
-
-                    using var cmd = new FbCommand(command, conn);
+                    cmd.CommandText = statement;
                     cmd.ExecuteNonQuery();
+                }
+                catch (FbException ex)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"Error executing statement:\n{statement}\n{ex.Message}");
+                    Console.ResetColor();
+                    throw; // Stop execution or handle as needed
                 }
             }
         }
@@ -319,9 +302,13 @@ namespace DbMetaTool
             using var sw = new StreamWriter(file, false, Encoding.UTF8);
 
             string sql =
-                @"SELECT RDB$FIELD_NAME, RDB$FIELD_TYPE
-                  FROM RDB$FIELDS
-                  WHERE RDB$SYSTEM_FLAG = 0";
+                @"SELECT DISTINCT f.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_LENGTH
+                  FROM RDB$FIELDS f
+                  JOIN RDB$RELATION_FIELDS rf ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+                  JOIN RDB$RELATIONS r ON rf.RDB$RELATION_NAME = r.RDB$RELATION_NAME
+                  WHERE r.RDB$SYSTEM_FLAG = 0
+                    AND f.RDB$SYSTEM_FLAG = 0
+                    AND f.RDB$FIELD_NAME NOT LIKE 'RDB$%'";
 
             using var cmd = new FbCommand(sql, conn);
             using var r = cmd.ExecuteReader();
@@ -329,9 +316,10 @@ namespace DbMetaTool
             while (r.Read())
             {
                 string name = r.GetString(0).Trim();
-                int type = r.GetInt32(1);
+                int type = r.GetInt16(1);
+                int length = r.IsDBNull(2) ? 0 : r.GetInt32(2);
 
-                sw.WriteLine($"CREATE DOMAIN {name} AS {MapFbType(type)};");
+                sw.WriteLine($"CREATE DOMAIN {name} AS {MapFbType(type, length)};");
             }
         }
 
@@ -356,10 +344,14 @@ namespace DbMetaTool
                 sw.WriteLine($"CREATE TABLE {tableName} (");
 
                 var fields = GetTableFields(conn, tableName);
-                foreach (var f in fields)
+
+                for (int i = 0; i < fields.Length; i++)
                 {
-                    string notNull = f.notNull ? "NOT NULL" : "NULL";
-                    sw.WriteLine($"  {f.name} {MapFbType(f.type)} {notNull},");
+                    var f = fields[i];
+                    string nullFlag = f.notNull ? "NOT NULL" : "";
+                    string comma = (i < fields.Length - 1) ? "," : "";
+
+                    sw.WriteLine($"  {f.name} {MapFbType(f.type, f.length)} {nullFlag}{(i < fields.Length - 1 ? "," : "")}");
                 }
 
                 sw.WriteLine(");");
@@ -367,18 +359,19 @@ namespace DbMetaTool
             }
         }
 
-        private static (string name, int type, bool notNull)[] GetTableFields(FbConnection conn, string tableName)
+        private static (string name, int type, int length, bool notNull)[] GetTableFields(FbConnection conn, string tableName)
         {
-            var result = new System.Collections.Generic.List<(string, int, bool)>();
+            var result = new System.Collections.Generic.List<(string, int, int, bool)>();
 
             string sql =
                 @"SELECT 
-                    f.RDB$FIELD_NAME,
-                    t.RDB$FIELD_TYPE,
-                    f.RDB$NULL_FLAG
-                  FROM RDB$RELATION_FIELDS f
-                  JOIN RDB$FIELDS t ON f.RDB$FIELD_SOURCE = t.RDB$FIELD_NAME
-                  WHERE f.RDB$RELATION_NAME = @T";
+            f.RDB$FIELD_NAME,
+            t.RDB$FIELD_TYPE,
+            t.RDB$FIELD_LENGTH,
+            f.RDB$NULL_FLAG
+          FROM RDB$RELATION_FIELDS f
+          JOIN RDB$FIELDS t ON f.RDB$FIELD_SOURCE = t.RDB$FIELD_NAME
+          WHERE f.RDB$RELATION_NAME = @T";
 
             using var cmd = new FbCommand(sql, conn);
             cmd.Parameters.AddWithValue("@T", tableName);
@@ -388,9 +381,10 @@ namespace DbMetaTool
             {
                 string name = r.GetString(0).Trim();
                 int type = r.GetInt32(1);
-                bool notNull = !r.IsDBNull(2);
+                int length = r.GetInt32(2);
+                bool notNull = !r.IsDBNull(3) && r.GetInt16(3) == 1;
 
-                result.Add((name, type, notNull));
+                result.Add((name, type, length, notNull));
             }
 
             return result.ToArray();
@@ -412,22 +406,19 @@ namespace DbMetaTool
             while (r.Read())
             {
                 string name = r.GetString(0).Trim();
-                string source = r.IsDBNull(1) ? "" : r.GetString(1);
+                string source = r.IsDBNull(1) ? "" : r.GetString(1).Trim();
 
                 // Pobranie parametrów procedury
-                string paramSql = @"SELECT 
-                                    RDB$PARAMETER_NAME, 
-                                    RDB$PARAMETER_TYPE, -- 0 = input, 1 = output
-                                    F.RDB$FIELD_TYPE,
-                                    F.RDB$FIELD_SUB_TYPE,
-                                    F.RDB$FIELD_LENGTH,
-                                    F.RDB$FIELD_SCALE,
-                                    F.RDB$CHARACTER_LENGTH,
-                                    F.RDB$CHARACTER_SET_ID
-                                FROM RDB$PROCEDURE_PARAMETERS P
-                                JOIN RDB$FIELDS F ON F.RDB$FIELD_NAME = P.RDB$FIELD_SOURCE
-                                WHERE P.RDB$PROCEDURE_NAME = @procName
-                                ORDER BY P.RDB$PARAMETER_NUMBER";
+                string paramSql = @"
+                                    SELECT 
+                                        P.RDB$PARAMETER_NAME, 
+                                        P.RDB$PARAMETER_TYPE, -- 0 = input, 1 = output
+                                        F.RDB$FIELD_TYPE,
+                                        F.RDB$FIELD_LENGTH
+                                    FROM RDB$PROCEDURE_PARAMETERS P
+                                    JOIN RDB$FIELDS F ON F.RDB$FIELD_NAME = P.RDB$FIELD_SOURCE
+                                    WHERE P.RDB$PROCEDURE_NAME = @procName
+                                    ORDER BY P.RDB$PARAMETER_NUMBER";
 
                 using var paramCmd = new FbCommand(paramSql, conn);
                 paramCmd.Parameters.AddWithValue("@procName", name);
@@ -439,10 +430,11 @@ namespace DbMetaTool
                 while (paramR.Read())
                 {
                     string paramName = paramR.GetString(0).Trim();
-                    short paramType = paramR.GetInt16(1); // 0 = input, 1 = output
-                    short fieldType = paramR.GetInt16(2); // typ Firebirda, trzeba zamienić na SQL
+                    short paramType = paramR.GetInt16(1);
+                    short fieldType = paramR.IsDBNull(2) ? (short)0 : paramR.GetInt16(2);
+                    int fieldLength = paramR.IsDBNull(3) ? 0 : paramR.GetInt32(3);
 
-                    string sqlType = MapFbType(fieldType);
+                    string sqlType = MapFbType(fieldType, fieldLength);
 
                     if (paramType == 0)
                         inputParams.Add($"{paramName} {sqlType}");
@@ -450,22 +442,25 @@ namespace DbMetaTool
                         outputParams.Add($"{paramName} {sqlType}");
                 }
 
-                // Tworzenie nagłówka procedury
-                sw.WriteLine($"CREATE PROCEDURE {name}");
-
-                if (inputParams.Count > 0)
-                    sw.WriteLine("  (" + string.Join(", ", inputParams) + ")");
-
-                if (outputParams.Count > 0)
-                    sw.WriteLine("RETURNS (" + string.Join(", ", outputParams) + ")");
-
+                // Ustawienie terminatora
                 sw.WriteLine("SET TERM ^ ;");
-                sw.WriteLine(source.Trim() + "^");
-                sw.WriteLine("SET TERM ; ^");
+
+                // Definicja procedury
+                sw.Write($"CREATE PROCEDURE {name}");
+                if (inputParams.Count > 0)
+                    sw.Write($" ({string.Join(", ", inputParams)})");
+                if (outputParams.Count > 0)
+                    sw.Write($" RETURNS ({string.Join(", ", outputParams)})");
+                sw.WriteLine();
+                sw.WriteLine("AS");              // dodanie AS
+                sw.WriteLine(source + "^");      // kończy procedurę terminatorem
+
+                sw.WriteLine("SET TERM ; ^");    // przywrócenie terminatora
+                sw.WriteLine();
             }
         }
 
-        private static string MapFbType(int type)
+        private static string MapFbType(int type, int length)
         {
             return type switch
             {
@@ -474,11 +469,12 @@ namespace DbMetaTool
                 10 => "FLOAT",
                 12 => "DATE",
                 13 => "TIME",
-                14 => "CHAR",
+                14 => $"CHAR({length})",
                 16 => "BIGINT",
                 27 => "DOUBLE PRECISION",
                 35 => "TIMESTAMP",
-                _ => "VARCHAR(100)"
+                261 => "BLOB",
+                _ => $"VARCHAR({length})"
             };
         }
 
